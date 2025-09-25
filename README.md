@@ -223,7 +223,7 @@ DemoHost/
 ```
 
 ## License
-(Add a LICENSE file if distributing.)
+MIT
 
 ## Quick Start (Minimal)
 

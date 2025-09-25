@@ -9,11 +9,6 @@ using CrossPlatformService.Services;
 using CrossPlatformService.Utilities;
 
 namespace CrossPlatformService.Platform.Mac;
-
-//// <summary>
-//// macOS (launchd) service management implementation (initial version).
-//// Service registration via launchctl commands and generated plist file.
-//// </summary>
 internal sealed class MacOsServiceManager : IServiceManager
 {
     public bool IsSupportedPlatform => RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
@@ -37,8 +32,7 @@ internal sealed class MacOsServiceManager : IServiceManager
         if (string.IsNullOrWhiteSpace(executablePath))
             throw new ArgumentException("Executable path cannot be empty.", nameof(executablePath));
 
-        var plistPath = GetPlistPath(serviceName, systemLevel: PrivilegeHelper.IsElevated());
-
+        var plistPath = GetPlistPath(serviceName, systemLevel: true);
         if (File.Exists(plistPath))
             throw new InvalidOperationException($"Plist already exists for '{serviceName}': {plistPath}");
 
@@ -62,49 +56,62 @@ internal sealed class MacOsServiceManager : IServiceManager
             throw new InvalidOperationException($"Plist file could not be written: {plistPath} - {ex.Message}", ex);
         }
 
-        // İzinler: launchd genelde root owned ve 644 bekler system daemons için
+        // launchd plist izinleri: root:wheel + 644 (aksi durumda load reddedebilir)
         try
         {
-            // chmod 644
+            _ = await ProcessRunner.RunAsync("chown", new[] { "root:wheel", plistPath }, cancellationToken: cancellationToken);
             _ = await ProcessRunner.RunAsync("chmod", new[] { "644", plistPath }, cancellationToken: cancellationToken);
         }
         catch { /* ignore */ }
 
-        // load
-        var load = await RunLaunchCtlAsync(new[] { "load", plistPath }, cancellationToken);
-        if (!load.Success)
+        // Modern akış: bootstrap + enable + kickstart
+        // (fallback olarak load/start da denenir)
+        var bootstrap = await RunLaunchCtlAsync(new[] { "bootstrap", "system", plistPath }, cancellationToken);
+        if (!bootstrap.Success && !bootstrap.StdErr.Contains("Service is already loaded", StringComparison.OrdinalIgnoreCase))
         {
-            try { File.Delete(plistPath); } catch { /* ignore */ }
-            throw new InvalidOperationException($"Plist load failed: {load}");
+            // Eski yöntemle dener
+            var load = await RunLaunchCtlAsync(new[] { "load", plistPath }, cancellationToken);
+            if (!load.Success)
+            {
+                try { File.Delete(plistPath); } catch { /* ignore */ }
+                throw new InvalidOperationException($"Plist bootstrap/load failed: {bootstrap.StdErr} {load.StdErr}".Trim());
+            }
         }
+
+        // enable (idempotent)
+        _ = await RunLaunchCtlAsync(new[] { "enable", $"system/{serviceName}" }, cancellationToken);
 
         if (autoStart)
         {
-            // RunAtLoad zaten true; yine de start denemesi
-            _ = await RunLaunchCtlAsync(new[] { "start", serviceName }, cancellationToken);
+            // kickstart: -k (crash sayacı reset), -p (on-demand)
+            var ks = await RunLaunchCtlAsync(new[] { "kickstart", "-k", $"system/{serviceName}" }, cancellationToken);
+            if (!ks.Success)
+            {
+                // fallback
+                _ = await RunLaunchCtlAsync(new[] { "start", serviceName }, cancellationToken);
+            }
         }
     }
 
     public async Task RemoveServiceAsync(string serviceName, CancellationToken cancellationToken = default)
     {
-        var plistPathSystem = GetPlistPath(serviceName, systemLevel: true);
-        var plistPathUser = GetPlistPath(serviceName, systemLevel: false);
+        var plistPath = GetPlistPath(serviceName, systemLevel: true);
+        if (!File.Exists(plistPath))
+        {
+            // User-level?
+            plistPath = GetPlistPath(serviceName, systemLevel: false);
+            if (!File.Exists(plistPath)) return;
+        }
 
-        var plistPath = File.Exists(plistPathSystem) ? plistPathSystem :
-                        File.Exists(plistPathUser) ? plistPathUser : null;
-
-        if (plistPath == null)
-            return;
-
-        // stop (hata olsa yok say)
+        // stop (ignore errors)
+        _ = await RunLaunchCtlAsync(new[] { "kill", "SIGTERM", $"system/{serviceName}" }, cancellationToken);
         _ = await RunLaunchCtlAsync(new[] { "stop", serviceName }, cancellationToken);
-        // unload
+
+        // bootout (modern unload)
+        _ = await RunLaunchCtlAsync(new[] { "bootout", "system", plistPath }, cancellationToken);
         _ = await RunLaunchCtlAsync(new[] { "unload", plistPath }, cancellationToken);
 
-        try
-        {
-            File.Delete(plistPath);
-        }
+        try { File.Delete(plistPath); }
         catch (Exception ex)
         {
             throw new InvalidOperationException($"Plist could not be deleted: {plistPath} - {ex.Message}", ex);
@@ -113,16 +120,22 @@ internal sealed class MacOsServiceManager : IServiceManager
 
     public async Task StartServiceAsync(string serviceName, CancellationToken cancellationToken = default)
     {
-        var result = await RunLaunchCtlAsync(new[] { "start", serviceName }, cancellationToken);
-        if (!result.Success)
-            throw new InvalidOperationException($"Service could not be started: {result}");
+        var ks = await RunLaunchCtlAsync(new[] { "kickstart", "-k", $"system/{serviceName}" }, cancellationToken);
+        if (!ks.Success)
+        {
+            var res = await RunLaunchCtlAsync(new[] { "start", serviceName }, cancellationToken);
+            if (!res.Success)
+                throw new InvalidOperationException($"Service could not be started: {ks.StdErr} {res.StdErr}".Trim());
+        }
     }
 
     public async Task StopServiceAsync(string serviceName, CancellationToken cancellationToken = default)
     {
-        var result = await RunLaunchCtlAsync(new[] { "stop", serviceName }, cancellationToken);
-        if (!result.Success)
-            throw new InvalidOperationException($"Service could not be stopped: {result}");
+        // kill SIGTERM + stop
+        var k = await RunLaunchCtlAsync(new[] { "kill", "SIGTERM", $"system/{serviceName}" }, cancellationToken);
+        var s = await RunLaunchCtlAsync(new[] { "stop", serviceName }, cancellationToken);
+        if (!k.Success && !s.Success)
+            throw new InvalidOperationException($"Service could not be stopped: {k.StdErr} {s.StdErr}".Trim());
     }
 
     public Task PauseServiceAsync(string serviceName, CancellationToken cancellationToken = default)
@@ -133,48 +146,46 @@ internal sealed class MacOsServiceManager : IServiceManager
 
     public async Task<ServiceStatus> GetServiceStatusAsync(string serviceName, CancellationToken cancellationToken = default)
     {
-        // launchctl list serviceName
-        var result = await RunLaunchCtlAsync(new[] { "list", serviceName }, cancellationToken);
-        if (!result.Success)
+        // Önce print ile domainli dene
+        var pr = await RunLaunchCtlAsync(new[] { "print", $"system/{serviceName}" }, cancellationToken);
+        if (pr.Success)
         {
-            var all = (result.StdOut + " " + result.StdErr).ToLowerInvariant();
+            var t = pr.StdOut;
+            if (t.Contains("state = running", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("pid =", StringComparison.OrdinalIgnoreCase))
+                return ServiceStatus.Running;
+
+            if (t.Contains("last exit code = 0", StringComparison.OrdinalIgnoreCase))
+                return ServiceStatus.Stopped;
+
+            return ServiceStatus.Error;
+        }
+
+        // Eski fallback: list
+        var ls = await RunLaunchCtlAsync(new[] { "list", serviceName }, cancellationToken);
+        if (!ls.Success)
+        {
+            var all = (ls.StdOut + " " + ls.StdErr).ToLowerInvariant();
             if (all.Contains("could not find") || all.Contains("no such process"))
                 return ServiceStatus.NotFound;
             return ServiceStatus.Error;
         }
 
-        // Örnek çıktı (yeni sürümlerde plist-like):
-        // {
-        //   "Label" = "myservice";
-        //   "LastExitStatus" = 0;
-        //   "PID" = 1234;
-        // }
-        var txt = result.StdOut;
+        var txt = ls.StdOut;
         if (txt.Contains("PID", StringComparison.OrdinalIgnoreCase))
         {
-            // PID satırı
-            // "PID" = 1234;
-            var lines = txt.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            foreach (var l in lines)
+            foreach (var line in txt.Split('\n'))
             {
-                var line = l.Trim();
-                if (line.StartsWith("\"PID\"", StringComparison.OrdinalIgnoreCase))
+                var l = line.Trim();
+                if (l.StartsWith("\"PID\"", StringComparison.OrdinalIgnoreCase) && l.Contains('='))
                 {
-                    if (line.Contains('='))
-                    {
-                        var parts = line.Split('=', StringSplitOptions.RemoveEmptyEntries);
-                        if (parts.Length >= 2)
-                        {
-                            var pidPart = parts[1].Trim().TrimEnd(';').Trim();
-                            if (int.TryParse(pidPart, out var pid) && pid > 0)
-                                return ServiceStatus.Running;
-                        }
-                    }
+                    var parts = l.Split('=', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 2 && int.TryParse(parts[1].Trim().TrimEnd(';'), out var pid) && pid > 0)
+                        return ServiceStatus.Running;
                 }
             }
         }
 
-        // Eğer PID yoksa exit status kontrolü
         if (txt.Contains("LastExitStatus", StringComparison.OrdinalIgnoreCase))
         {
             if (txt.Contains("LastExitStatus\" = 0", StringComparison.OrdinalIgnoreCase))
@@ -198,17 +209,15 @@ internal sealed class MacOsServiceManager : IServiceManager
         IDictionary<string, string>? environmentVariables,
         bool runAtLoad)
     {
-        // EnvironmentVariables launchd dict formatında
+        // EnvironmentVariables (launchd dict)
         var envBuilder = new StringBuilder();
         if (environmentVariables != null)
         {
             foreach (var kv in environmentVariables)
-            {
                 envBuilder.AppendLine($"        <key>{XmlEscape(kv.Key)}</key><string>{XmlEscape(kv.Value)}</string>");
-            }
         }
 
-        var envSection = environmentVariables != null && environmentVariables.Count > 0
+        var envSection = (environmentVariables != null && environmentVariables.Count > 0)
             ? $@"    <key>EnvironmentVariables</key>
     <dict>
 {envBuilder.ToString().TrimEnd()}
@@ -216,33 +225,43 @@ internal sealed class MacOsServiceManager : IServiceManager
 "
             : string.Empty;
 
-        // Standart log yolu (opsiyonel). İleride yapılandırılabilir hale getirilebilir.
         var stdOut = $"/var/log/{label}.out.log";
         var stdErr = $"/var/log/{label}.err.log";
 
+        // ÖNEMLİ: --service-run eklendi, KeepAlive dict'e çevrildi
         return $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <!DOCTYPE plist PUBLIC ""-//Apple//DTD PLIST 1.0//EN"" ""http://www.apple.com/DTDs/PropertyList-1.0.dtd"">
 <plist version=""1.0"">
 <dict>
     <key>Label</key>
     <string>{XmlEscape(label)}</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>{XmlEscape(executablePath)}</string>
+        <string>--service-run</string>
     </array>
+
     <key>WorkingDirectory</key>
     <string>{XmlEscape(workingDirectory)}</string>
+
     <key>RunAtLoad</key>
     <{(runAtLoad ? "true" : "false")}/>
+
     <key>KeepAlive</key>
-    <true/>
-    {envSection}<key>StandardOutPath</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+{envSection}    <key>StandardOutPath</key>
     <string>{XmlEscape(stdOut)}</string>
     <key>StandardErrorPath</key>
     <string>{XmlEscape(stdErr)}</string>
+
     <key>ProcessType</key>
     <string>Background</string>
-    <!-- Description (informational) -->
+
     <key>Comment</key>
     <string>{XmlEscape(description)}</string>
 </dict>
@@ -251,12 +270,11 @@ internal sealed class MacOsServiceManager : IServiceManager
     }
 
     private static string XmlEscape(string value) =>
-        value
-            .Replace("&", "&amp;")
-            .Replace("<", "&lt;")
-            .Replace(">", "&gt;")
-            .Replace("\"", "&quot;")
-            .Replace("'", "&apos;");
+        value.Replace("&", "&amp;")
+             .Replace("<", "&lt;")
+             .Replace(">", "&gt;")
+             .Replace("\"", "&quot;")
+             .Replace("'", "&apos;");
 
     private static Task<ProcessRunner.ProcessResult> RunLaunchCtlAsync(IEnumerable<string> args, CancellationToken ct)
         => ProcessRunner.RunAsync("launchctl", args, cancellationToken: ct);

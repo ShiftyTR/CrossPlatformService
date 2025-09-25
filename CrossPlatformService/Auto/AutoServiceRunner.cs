@@ -9,14 +9,14 @@ using Microsoft.Extensions.Hosting;
 
 namespace CrossPlatformService.Auto;
 
-//// <summary>
-//// Single-command behavior:
-//// - If service not installed and elevated: install, start, then exit
-//// - If service not installed and NOT elevated: run in foreground (console) test mode
-//// - If service is installed:
-////     * If launched interactively (user console): inform and exit
-////     * If running under a service context (Windows Service / systemd / launchd) run the normal host loop
-//// </summary>
+/// <summary>
+/// Single-command behavior:
+/// - If service not installed and elevated: install, start, then exit
+/// - If service not installed and NOT elevated: run in foreground (console) test mode
+/// - If service is installed:
+///     * If launched interactively (user console): inform and exit
+///     * If running under a service context (Windows Service / systemd / launchd) run the normal host loop
+/// </summary>
 public static class AutoServiceRunner
 {
     public static async Task<int> RunAsync(
@@ -28,12 +28,19 @@ public static class AutoServiceRunner
         var manager = ServiceManagerFactory.Create();
         var status = await SafeGetStatusAsync(manager, serviceName, cancellationToken);
 
-        bool serviceProcess = IsWindowsServiceProcess();
+        // NEW: servis bağlamı algısı + manuel zorlama
+        bool forceServiceRun = HasArg("--service-run");
+        bool isWindowsSvc = IsWindowsServiceProcess();
+        bool isLaunchdSvc = IsLaunchdServiceProcess();
+        bool isSystemdSvc = IsSystemdServiceProcess();
+        bool serviceProcess = forceServiceRun || isWindowsSvc || isLaunchdSvc || isSystemdSvc;
+
+        // ÖNEMLİ: launchd/systemd altındayken asla "interactive" sayma
         bool interactive = !serviceProcess && IsInteractive();
 
-        // If already in a Windows Service context (Session 0) run host directly.
         if (serviceProcess)
         {
+            // launchd / systemd / Windows Service / --service-run → doğrudan worker loop
             return await RunForegroundAsync(serviceName, description, configureHost, cancellationToken);
         }
 
@@ -41,10 +48,11 @@ public static class AutoServiceRunner
         {
             if (PrivilegeHelper.IsElevated())
             {
-                    Console.WriteLine($"[AutoService] Service '{serviceName}' not found. Starting installation...");
+                Console.WriteLine($"[AutoService] Service '{serviceName}' not found. Starting installation...");
                 try
                 {
-                    await manager.InstallServiceAsync(serviceName,
+                    await manager.InstallServiceAsync(
+                        serviceName,
                         executablePath: Environment.ProcessPath
                             ?? throw new InvalidOperationException("ProcessPath could not be read."),
                         description: description,
@@ -61,8 +69,8 @@ public static class AutoServiceRunner
                     Console.ForegroundColor = ConsoleColor.Red;
                     Console.WriteLine("[AutoService] Service installation failed: " + ex.Message);
                     Console.ResetColor();
-                    if (!interactive)
-                        return 2;
+                    if (!interactive) return 2;
+
                     Console.WriteLine("[AutoService] Falling back to foreground console mode...");
                     return await RunForegroundAsync(serviceName, description, configureHost, cancellationToken);
                 }
@@ -76,15 +84,14 @@ public static class AutoServiceRunner
         }
         else
         {
-            // Servis mevcut
             if (interactive)
             {
-                // Kullanıcı manuel çalıştırdı; servis zaten kurulu. Bilgilendir ve çık.
+                // Kullanıcı konsolundan çalıştırıldıysa uyar ve çık
                 Console.WriteLine($"[AutoService] Service '{serviceName}' already installed. Use system service control (start/stop).");
                 return 0;
             }
 
-            // Servis context'i (WindowsService/systemd/launchd) içerisinde: host'u çalıştır.
+            // Servis bağlamı ise host'u çalıştır
             return await RunForegroundAsync(serviceName, description, configureHost, cancellationToken);
         }
     }
@@ -96,28 +103,16 @@ public static class AutoServiceRunner
         CancellationToken ct)
     {
         var builder = Host.CreateDefaultBuilder();
-
-        // Windows / Linux entegrasyonu koşullu.
         builder.UseContentRoot(AppContext.BaseDirectory);
+
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             builder.UseWindowsService();
         }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            // systemd entegrasyonu opsiyonel. UseSystemd() çağrısı kaldırıldı (paket tüm platformlarda referanslı değil).
-        }
+        // Linux/macOS: ek lifetime zorunlu değil; SIGTERM ile kapanır.
 
-        builder.ConfigureServices(services =>
-        {
-            // Tüketen uygulama (DemoHost) kendi hosted servislerini ekleyecek (Worker vs.)
-            // Burada generic ekleme yapılmadı.
-        });
-
+        builder.ConfigureServices(_ => { /* hosted services dışarıdan eklenecek */ });
         configureHost?.Invoke(builder);
-
-        // Windows service context için ekstra ServiceBase sarmalayıcı kaldırıldı.
-        // UseWindowsService() host lifetime sinyallerini (Start/Stop) yönetir.
 
         using var host = builder.Build();
         Console.WriteLine($"[AutoService] '{serviceName}' run loop starting (foreground/service context).");
@@ -125,31 +120,70 @@ public static class AutoServiceRunner
         return 0;
     }
 
+    // --- helpers ---
+
+    private static bool HasArg(string arg) =>
+        Environment.GetCommandLineArgs().Any(a => string.Equals(a, arg, StringComparison.OrdinalIgnoreCase));
+
     private static bool IsWindowsServiceProcess()
     {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return false;
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
         try
         {
             using var proc = Process.GetCurrentProcess();
-            // Windows servisleri Session 0'da koşar.
-            if (proc.SessionId == 0)
-                return true;
+            return proc.SessionId == 0; // Windows Service → Session 0
+        }
+        catch { return false; }
+    }
+
+    // macOS launchd bağlamı tespiti
+    private static bool IsLaunchdServiceProcess()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) return false;
+
+        // launchd tipik env değişkenleri
+        string? xpc = Environment.GetEnvironmentVariable("XPC_SERVICE_NAME");
+        string? label = Environment.GetEnvironmentVariable("LAUNCH_JOBKEY_LABEL");
+        if (!string.IsNullOrEmpty(xpc) || !string.IsNullOrEmpty(label))
+            return true;
+
+        // TTY yoksa büyük olasılıkla servis bağlamıdır (savunmacı yaklaşım)
+        try
+        {
+            bool hasTty = !(Console.IsInputRedirected && Console.IsOutputRedirected && Console.IsErrorRedirected);
+            if (!hasTty) return true;
         }
         catch { /* ignore */ }
+
+        return false;
+    }
+
+    // Linux systemd bağlamı tespiti (hafif sezgisel, yeterli)
+    private static bool IsSystemdServiceProcess()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return false;
+
+        // systemd tipik env: INVOCATION_ID, NOTIFY_SOCKET vb.
+        string? inv = Environment.GetEnvironmentVariable("INVOCATION_ID");
+        string? ns = Environment.GetEnvironmentVariable("NOTIFY_SOCKET");
+        if (!string.IsNullOrEmpty(inv) || !string.IsNullOrEmpty(ns))
+            return true;
+
+        // TTY yoksa servis olma ihtimali yüksek
+        try
+        {
+            bool hasTty = !(Console.IsInputRedirected && Console.IsOutputRedirected && Console.IsErrorRedirected);
+            if (!hasTty) return true;
+        }
+        catch { /* ignore */ }
+
         return false;
     }
 
     private static bool IsInteractive()
     {
-        try
-        {
-            return Environment.UserInteractive;
-        }
-        catch
-        {
-            return true; // Varsayılan güvenli varsayım
-        }
+        try { return Environment.UserInteractive; }
+        catch { return true; } // güvenli varsayım
     }
 
     private static async Task<ServiceStatus> SafeGetStatusAsync(
@@ -157,13 +191,7 @@ public static class AutoServiceRunner
         string serviceName,
         CancellationToken ct)
     {
-        try
-        {
-            return await manager.GetServiceStatusAsync(serviceName, ct);
-        }
-        catch
-        {
-            return ServiceStatus.Unknown;
-        }
+        try { return await manager.GetServiceStatusAsync(serviceName, ct); }
+        catch { return ServiceStatus.Unknown; }
     }
 }

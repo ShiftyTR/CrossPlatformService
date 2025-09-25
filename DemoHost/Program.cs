@@ -68,14 +68,17 @@ internal static class Program
                 switch (command)
                 {
                     case "install":
+                        // workerArgList burada 'install' haricinde kalan tüm token'ları içerir.
+                        // Bunları kalıcı servis argümanları olarak iletiriz.
                         await manager.InstallServiceAsync(serviceName,
                             executablePath: Environment.ProcessPath
                                 ?? throw new InvalidOperationException("ProcessPath not available."),
                             description: description,
                             environmentVariables: null,
+                            serviceArguments: workerArgList.Count > 0 ? workerArgList : null,
                             autoStart: true,
                             cancellationToken: CancellationToken.None);
-                        Console.WriteLine($"[CLI] Installed service '{serviceName}'.");
+                        Console.WriteLine($"[CLI] Installed service '{serviceName}' with args: {string.Join(' ', workerArgList)}");
                         return 0;
 
                     case "uninstall":

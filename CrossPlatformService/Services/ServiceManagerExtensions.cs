@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace CrossPlatformService.Services;
 
@@ -18,12 +19,15 @@ public static class ServiceManagerExtensions
         string serviceName,
         string? description = null,
         bool autoStart = true,
+        IEnumerable<string>? serviceArguments = null,
+        System.Collections.Generic.IDictionary<string, string>? environmentVariables = null,
         CancellationToken cancellationToken = default)
         => manager.InstallServiceAsync(
             serviceName,
             GetCurrentExecutablePath(),
             description,
-            environmentVariables: null,
+            environmentVariables,
+            serviceArguments,
             autoStart,
             cancellationToken);
 
@@ -34,11 +38,15 @@ public static class ServiceManagerExtensions
         string serviceName,
         string? description = null,
         bool autoStart = true,
+        IEnumerable<string>? serviceArguments = null,
+        System.Collections.Generic.IDictionary<string, string>? environmentVariables = null,
         CancellationToken cancellationToken = default)
         => ServiceManagerFactory.Create().InstallCurrentApplicationAsync(
             serviceName,
             description,
             autoStart,
+            serviceArguments,
+            environmentVariables,
             cancellationToken);
 
     /// <summary>

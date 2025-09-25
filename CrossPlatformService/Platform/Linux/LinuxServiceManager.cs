@@ -26,6 +26,7 @@ internal sealed class LinuxServiceManager : IServiceManager
         string executablePath,
         string? description = null,
         IDictionary<string, string>? environmentVariables = null,
+        IEnumerable<string>? serviceArguments = null,
         bool autoStart = true,
         CancellationToken cancellationToken = default)
     {
@@ -41,7 +42,34 @@ internal sealed class LinuxServiceManager : IServiceManager
         if (File.Exists(unitPath))
             throw new InvalidOperationException($"Systemd unit already exists for '{serviceName}': {unitPath}");
 
-        // Working directory (directory containing the executable)
+        // Eğer binary /root altında ise SELinux context (admin_home_t) nedeniyle systemd tarafından EXEC reddi (203/EXEC Permission denied) yaşanabilir.
+        // Güvenli, canonical bir konuma kopyala: /usr/local/lib/<serviceName>/<binary>
+        // (self-contained tek binary varsayımı; kopyalama başarısız olursa orijinal yolu kullanır.)
+        try
+        {
+            var fullExec = Path.GetFullPath(executablePath);
+            if (fullExec.StartsWith("/root/", StringComparison.Ordinal))
+            {
+                var targetDir = Path.Combine("/usr/local/lib", serviceName);
+                Directory.CreateDirectory(targetDir);
+                var targetPath = Path.Combine(targetDir, Path.GetFileName(fullExec));
+                File.Copy(fullExec, targetPath, overwrite: true);
+
+                // chmod 755
+                try { _ = ProcessRunner.RunAsync("chmod", new[] { "755", targetPath }, cancellationToken: cancellationToken); } catch { /* ignore */ }
+
+                // restorecon (SELinux) – başarısız olabilir, önemli değil
+                try { _ = ProcessRunner.RunAsync("restorecon", new[] { targetPath }, cancellationToken: cancellationToken); } catch { /* ignore */ }
+
+                executablePath = targetPath;
+            }
+        }
+        catch
+        {
+            // Sessiz geç; orijinal executablePath kullanılacak
+        }
+
+        // Working directory (directory containing the executable) – relocation sonrası tekrar al
         var workDir = Path.GetDirectoryName(Path.GetFullPath(executablePath)) ?? "/";
 
         var unitContent = BuildUnitFileContent(
@@ -50,6 +78,7 @@ internal sealed class LinuxServiceManager : IServiceManager
             workDir,
             description,
             environmentVariables,
+            serviceArguments,
             autoStart);
 
         try
@@ -165,6 +194,7 @@ internal sealed class LinuxServiceManager : IServiceManager
         string workingDirectory,
         string? description,
         IDictionary<string, string>? environmentVariables,
+        IEnumerable<string>? serviceArguments,
         bool autoStart)
     {
         var sb = new StringBuilder();
@@ -174,7 +204,19 @@ internal sealed class LinuxServiceManager : IServiceManager
         sb.AppendLine();
         sb.AppendLine("[Service]");
         sb.AppendLine("Type=simple");
-        sb.AppendLine($"ExecStart={QuoteIfNeeded(executablePath)}");
+
+        var execBuilder = new StringBuilder();
+        execBuilder.Append(QuoteIfNeeded(executablePath));
+        if (serviceArguments != null)
+        {
+            foreach (var arg in serviceArguments)
+            {
+                if (string.IsNullOrWhiteSpace(arg)) continue;
+                execBuilder.Append(' ').Append(Escape(arg));
+            }
+        }
+        sb.AppendLine($"ExecStart={execBuilder}");
+
         sb.AppendLine($"WorkingDirectory={Escape(workingDirectory)}");
         sb.AppendLine("Restart=on-failure");
         sb.AppendLine("RestartSec=5");
@@ -182,13 +224,9 @@ internal sealed class LinuxServiceManager : IServiceManager
         {
             foreach (var kv in environmentVariables)
             {
-                // systemd Environment=KEY=VALUE line
                 sb.AppendLine($"Environment=\"{Escape(kv.Key)}={Escape(kv.Value)}\"");
             }
         }
-        // stdout / stderr redirection (optional)
-        // sb.AppendLine($"StandardOutput=append:/var/log/{serviceName}.out.log");
-        // sb.AppendLine($"StandardError=append:/var/log/{serviceName}.err.log");
         sb.AppendLine();
         sb.AppendLine("[Install]");
         sb.AppendLine("WantedBy=multi-user.target");

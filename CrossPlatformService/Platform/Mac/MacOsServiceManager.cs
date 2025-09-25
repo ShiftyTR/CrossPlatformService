@@ -22,6 +22,7 @@ internal sealed class MacOsServiceManager : IServiceManager
         string executablePath,
         string? description = null,
         IDictionary<string, string>? environmentVariables = null,
+        IEnumerable<string>? serviceArguments = null,
         bool autoStart = true,
         CancellationToken cancellationToken = default)
     {
@@ -44,6 +45,7 @@ internal sealed class MacOsServiceManager : IServiceManager
             workingDirectory: workingDir,
             description: description ?? serviceName,
             environmentVariables: environmentVariables,
+            serviceArguments: serviceArguments,
             runAtLoad: autoStart);
 
         try
@@ -207,6 +209,7 @@ internal sealed class MacOsServiceManager : IServiceManager
         string workingDirectory,
         string description,
         IDictionary<string, string>? environmentVariables,
+        IEnumerable<string>? serviceArguments,
         bool runAtLoad)
     {
         // EnvironmentVariables (launchd dict)
@@ -240,6 +243,7 @@ internal sealed class MacOsServiceManager : IServiceManager
     <array>
         <string>{XmlEscape(executablePath)}</string>
         <string>--service-run</string>
+{(serviceArguments != null ? string.Join(Environment.NewLine, serviceArguments.Select(a => $"        <string>{XmlEscape(a)}</string>")) : string.Empty)}
     </array>
 
     <key>WorkingDirectory</key>

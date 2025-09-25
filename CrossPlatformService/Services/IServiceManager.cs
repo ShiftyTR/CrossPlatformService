@@ -25,6 +25,7 @@ public interface IServiceManager
         string executablePath,
         string? description = null,
         IDictionary<string, string>? environmentVariables = null,
+        IEnumerable<string>? serviceArguments = null,
         bool autoStart = true,
         CancellationToken cancellationToken = default);
 

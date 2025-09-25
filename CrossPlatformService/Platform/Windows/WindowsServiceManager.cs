@@ -35,6 +35,7 @@ internal sealed class WindowsServiceManager : IServiceManager
         string executablePath,
         string? description = null,
         IDictionary<string, string>? environmentVariables = null,
+        IEnumerable<string>? serviceArguments = null,
         bool autoStart = true,
         CancellationToken cancellationToken = default)
     {
@@ -50,12 +51,29 @@ internal sealed class WindowsServiceManager : IServiceManager
         if (exists)
             throw new InvalidOperationException($"Service '{serviceName}' already exists.");
 
+        // Build full binPath with optional arguments
+        string Quote(string a)
+        {
+            if (string.IsNullOrEmpty(a)) return "\"\"";
+            return a.Contains(' ') || a.Contains('"')
+                ? $"\"{a.Replace("\"", "\\\"")}\""
+                : a;
+        }
+
+        var argSegment = serviceArguments != null
+            ? string.Join(' ', serviceArguments.Select(Quote))
+            : string.Empty;
+
+        var fullBinPath = string.IsNullOrEmpty(argSegment)
+            ? $"\"{executablePath}\""
+            : $"\"{executablePath}\" {argSegment}";
+
         // sc create command (a space must follow binPath= and start= parameters)
         var createArgs = new List<string>
         {
             "create",
             serviceName,
-            "binPath=", $"\"{executablePath}\"",
+            "binPath=", fullBinPath,
             "start=", autoStart ? "auto" : "demand"
         };
 
